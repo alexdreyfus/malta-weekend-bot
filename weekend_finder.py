@@ -3,6 +3,7 @@
 
 import os
 import sys
+import time
 from datetime import date, timedelta
 from urllib.parse import quote
 
@@ -73,7 +74,7 @@ def upcoming_weekend(today: date) -> tuple[date, date]:
 
 
 def fetch_weather(lat: float, lon: float, start: date, end: date) -> dict | None:
-    """Fetch forecast for date range. Returns None on failure."""
+    """Fetch forecast for date range. Retries once on failure. Returns None if both attempts fail."""
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -83,13 +84,18 @@ def fetch_weather(lat: float, lon: float, start: date, end: date) -> dict | None
         "end_date": end.isoformat(),
         "timezone": "auto",
     }
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except requests.RequestException as exc:
-        print(f"weather fetch failed for {lat},{lon}: {exc}", file=sys.stderr)
-        return None
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt == 1:
+                time.sleep(1.5)
+    print(f"weather fetch failed for {lat},{lon} after 2 attempts: {last_exc}", file=sys.stderr)
+    return None
 
 
 def evaluate(data: dict) -> dict | None:
