@@ -1,0 +1,21 @@
+name: Test Telegram send
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send hello message
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -sS -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="Hello from GitHub Actions! If you see this, your bot token and chat ID are wired up correctly." \
+            | tee response.json
+          # Fail the step if Telegram didn't return ok:true
+          grep -q '"ok":true' response.json
