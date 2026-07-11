@@ -70,7 +70,7 @@ socket.getaddrinfo = _ipv4_only
 _SESSION = requests.Session()
 
 _START = _t.time()
-_BUDGET = 150  # seconds: hard ceiling for the whole run's network work
+_BUDGET = 240  # seconds: hard ceiling for the whole run's network work
 
 
 def _time_left():
@@ -92,7 +92,9 @@ def _req(method, url, tries=3, timeout=(10, 20), **kw):
             _t.sleep(min(2 * (attempt + 1), max(0, _time_left())))
     raise last
 
-AIRPORT = "LMML"
+AIRPORTS = [a.strip().upper() for a in
+            os.getenv("AIRPORTS", "LMML,GMMX").split(",") if a.strip()]
+AIRPORT_NAMES = {"LMML": "Malta (LMML)", "GMMX": "Marrakech (GMMX)"}
 OPENSKY_BASE = "https://opensky-network.org/api"
 TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
              "opensky-network/protocol/openid-connect/token")
@@ -138,21 +140,22 @@ def day_chunks(begin, end):
         t += DAY
 
 
-def fetch(endpoint, begin, end, token):
+def fetch(airport, endpoint, begin, end, token):
     headers = {"Authorization": f"Bearer {token}"}
     out = []
     for lo, hi in day_chunks(begin, end):
         try:
             r = _req("GET",
                 f"{OPENSKY_BASE}/flights/{endpoint}",
-                params={"airport": AIRPORT, "begin": int(lo), "end": int(hi)},
+                params={"airport": airport, "begin": int(lo), "end": int(hi)},
                 headers=headers)
             if r.status_code == 404:
                 continue
             r.raise_for_status()
             out.extend(r.json())
         except Exception as e:
-            print(f"[warn] {endpoint} {int(lo)}-{int(hi)}: {e}", file=sys.stderr)
+            print(f"[warn] {airport} {endpoint} {int(lo)}-{int(hi)}: {e}",
+                  file=sys.stderr)
     return out
 
 
@@ -216,13 +219,10 @@ def send_telegram(text):
     ).raise_for_status()
 
 
-def main():
-    now = int(time.time())
-    begin = now - LOOKBACK_DAYS * DAY
-    token = get_token()
-
-    arrivals = fetch("arrival", begin, now, token)
-    departures = fetch("departure", begin, now, token)
+def scan_airport(airport, begin, now, token):
+    """Return the sorted list of idle charter aircraft parked at `airport`."""
+    arrivals = fetch(airport, "arrival", begin, now, token)
+    departures = fetch(airport, "departure", begin, now, token)
 
     last_dep = {}
     for d in departures:
@@ -259,15 +259,16 @@ def main():
         })
 
     parked.sort(key=lambda x: x["dwell"], reverse=True)
+    return parked
 
+
+def render_section(airport, parked):
+    name = AIRPORT_NAMES.get(airport, airport)
+    lines = [f"\U0001F6E9\uFE0F <b>{name}</b> \u2014 "
+             f"{len(parked)} parked >{MIN_DWELL_DAYS:g}d"]
     if not parked:
-        if SEND_EMPTY:
-            send_telegram("\U0001F6E9\uFE0F <b>Malta idle-jet radar</b>\nNo "
-                          f"actionable tails parked over {MIN_DWELL_DAYS:g}d.")
-        return
-
-    lines = [f"\U0001F6E9\uFE0F <b>Idle jets at Malta (LMML)</b> \u2014 "
-             f"{len(parked)} parked >{MIN_DWELL_DAYS:g}d\n"]
+        lines.append("   nothing idle right now")
+        return lines
     for p in parked:
         lines.append(
             f"\u2022 <b>{p['reg']}</b>  {p['type']} \u00B7 {p['dwell']:.1f}d "
@@ -278,9 +279,27 @@ def main():
                 lines.append(f"   \u21B3 next: {dest} \u00B7 {fmt_dep(dep_iso)}")
             else:
                 lines.append("   \u21B3 no plan filed \u2014 open target")
-    lines.append("\nAlready on-island = zero ferry cost. "
-                 "Check the operator before you call.")
-    send_telegram("\n".join(lines))
+    return lines
+
+
+def main():
+    now = int(time.time())
+    begin = now - LOOKBACK_DAYS * DAY
+    token = get_token()
+
+    results = {ap: scan_airport(ap, begin, now, token) for ap in AIRPORTS}
+    total = sum(len(v) for v in results.values())
+
+    if total == 0 and not SEND_EMPTY:
+        return
+
+    blocks = []
+    for ap in AIRPORTS:
+        blocks.append("\n".join(render_section(ap, results[ap])))
+    msg = "\n\n".join(blocks)
+    msg += ("\n\nAlready on-site = zero ferry cost. "
+            "Check the operator before you call.")
+    send_telegram(msg)
 
 
 if __name__ == "__main__":
