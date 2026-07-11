@@ -4,27 +4,35 @@ idle_jets_bot.py
 ----------------
 Daily Telegram alert of private/business jets sitting IDLE at Malta
 International (LMML). A jet that arrived N days ago and hasn't departed is a
-charter candidate with no positioning (ferry) cost — the metal is already here.
+charter candidate with no positioning (ferry) cost -- the metal is already here.
 
-Drops into the existing `malta-weekend-bot` repo and reuses its Telegram
-secrets. Only new secrets required: OpenSky OAuth credentials.
+Reuses the malta-weekend-bot's existing Telegram secrets. Only new secrets:
+OpenSky OAuth credentials.
+
+NOTE ON DATA FRESHNESS
+======================
+OpenSky's arrival/departure tables are built by a nightly batch, so they run
+roughly a day behind and each query is capped at a ~2-day window (we slice the
+lookback into daily chunks below to respect that). For spotting jets parked
+more than a day this lag is fine; the one edge effect is that a jet which left
+*this morning* may still show as parked until the batch catches up.
 
 ENV / SECRETS
 =============
-  TELEGRAM_BOT_TOKEN   (already in the repo)
-  TELEGRAM_CHAT_ID     (already in the repo)
-  OPENSKY_CLIENT_ID    (new — from opensky-network.org Account page)
-  OPENSKY_CLIENT_SECRET(new)
+  TELEGRAM_BOT_TOKEN    (already in the repo)
+  TELEGRAM_CHAT_ID      (already in the repo)
+  OPENSKY_CLIENT_ID     (new -- opensky-network.org Account page)
+  OPENSKY_CLIENT_SECRET (new)
 Optional tuning:
-  LOOKBACK_DAYS   default 6      (keep <= 7 per OpenSky call)
+  LOOKBACK_DAYS   default 6
   MIN_DWELL_DAYS  default 1.0
   JETS_ONLY       default "1"    (set "0" to include everything parked)
   SEND_EMPTY      default "1"    (set "0" to stay silent when nothing found)
 """
 
 import os
+import sys
 import time
-import urllib.parse
 from datetime import datetime, timezone
 
 import requests
@@ -34,8 +42,8 @@ OPENSKY_BASE = "https://opensky-network.org/api"
 TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
              "opensky-network/protocol/openid-connect/token")
 ADSBDB = "https://api.adsbdb.com/v0/aircraft/"  # free icao24 -> reg/type lookup
+DAY = 86400
 
-# Business-jet ICAO type designators used to keep airliners/GA turboprops out.
 BIZJET_TYPES = {
     "C25A","C25B","C25C","C25M","C500","C501","C510","C525","C550","C560",
     "C56X","C650","C680","C68A","C700","C750","CL30","CL35","CL60","GL5T",
@@ -52,24 +60,40 @@ SEND_EMPTY = os.getenv("SEND_EMPTY", "1") == "1"
 
 
 def get_token():
-    cid = os.environ["OPENSKY_CLIENT_ID"]
-    secret = os.environ["OPENSKY_CLIENT_SECRET"]
     r = requests.post(TOKEN_URL, timeout=30, data={
         "grant_type": "client_credentials",
-        "client_id": cid, "client_secret": secret})
+        "client_id": os.environ["OPENSKY_CLIENT_ID"],
+        "client_secret": os.environ["OPENSKY_CLIENT_SECRET"]})
     r.raise_for_status()
     return r.json()["access_token"]
 
 
+def day_chunks(begin, end):
+    """Yield [lo, hi] slices <= 1 day, aligned to UTC midnight, so each call
+    stays within OpenSky's 2-day / single-day-boundary interval limit."""
+    t = begin - (begin % DAY)  # floor to UTC midnight
+    while t < end:
+        yield max(t, begin), min(t + DAY, end)
+        t += DAY
+
+
 def fetch(endpoint, begin, end, token):
-    r = requests.get(
-        f"{OPENSKY_BASE}/flights/{endpoint}",
-        params={"airport": AIRPORT, "begin": int(begin), "end": int(end)},
-        headers={"Authorization": f"Bearer {token}"}, timeout=60)
-    if r.status_code == 404:
-        return []
-    r.raise_for_status()
-    return r.json()
+    """endpoint in {'arrival','departure'}; queries in daily slices."""
+    headers = {"Authorization": f"Bearer {token}"}
+    out = []
+    for lo, hi in day_chunks(begin, end):
+        try:
+            r = requests.get(
+                f"{OPENSKY_BASE}/flights/{endpoint}",
+                params={"airport": AIRPORT, "begin": int(lo), "end": int(hi)},
+                headers=headers, timeout=60)
+            if r.status_code == 404:      # no flights in this slice
+                continue
+            r.raise_for_status()
+            out.extend(r.json())
+        except Exception as e:            # one bad slice shouldn't kill the run
+            print(f"[warn] {endpoint} {int(lo)}-{int(hi)}: {e}", file=sys.stderr)
+    return out
 
 
 def enrich(icao24):
@@ -97,7 +121,7 @@ def send_telegram(text):
 
 def main():
     now = int(time.time())
-    begin = now - LOOKBACK_DAYS * 86400
+    begin = now - LOOKBACK_DAYS * DAY
     token = get_token()
 
     arrivals = fetch("arrival", begin, now, token)
@@ -119,13 +143,12 @@ def main():
         arr_t = a.get("lastSeen") or 0
         if last_dep.get(icao24, 0) > arr_t:          # departed after arriving
             continue
-        dwell = (now - arr_t) / 86400
+        dwell = (now - arr_t) / DAY
         if dwell < MIN_DWELL_DAYS:
             continue
         reg, typ = enrich(icao24)
         if JETS_ONLY and typ and typ not in BIZJET_TYPES:
             continue
-        # If we couldn't ID the type and JETS_ONLY is on, keep it but flag "?"
         parked.append({
             "reg": reg or icao24.upper(),
             "type": typ or "?",
@@ -138,16 +161,16 @@ def main():
 
     if not parked:
         if SEND_EMPTY:
-            send_telegram("🛩️ <b>Malta idle-jet radar</b>\nNothing parked "
+            send_telegram("\U0001F6E9\uFE0F <b>Malta idle-jet radar</b>\nNothing parked "
                           f"over {MIN_DWELL_DAYS:g}d right now.")
         return
 
-    lines = [f"🛩️ <b>Idle jets at Malta (LMML)</b> — {len(parked)} parked "
+    lines = [f"\U0001F6E9\uFE0F <b>Idle jets at Malta (LMML)</b> \u2014 {len(parked)} parked "
              f">{MIN_DWELL_DAYS:g}d\n"]
     for p in parked:
         lines.append(
-            f"• <b>{p['reg']}</b>  {p['type']} · {p['dwell']:.1f}d · "
-            f"from {p['from']} · in {p['arr']:%b %d}")
+            f"\u2022 <b>{p['reg']}</b>  {p['type']} \u00B7 {p['dwell']:.1f}d \u00B7 "
+            f"from {p['from']} \u00B7 in {p['arr']:%b %d}")
     lines.append("\nAlready on-island = zero ferry cost. "
                  "Cross-check the tail's operator before you call.")
     send_telegram("\n".join(lines))
