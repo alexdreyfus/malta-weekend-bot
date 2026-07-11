@@ -70,7 +70,7 @@ socket.getaddrinfo = _ipv4_only
 _SESSION = requests.Session()
 
 _START = _t.time()
-_BUDGET = 240  # seconds: hard ceiling for the whole run's network work
+_BUDGET = 300  # seconds: hard ceiling for the whole run's network work
 
 
 def _time_left():
@@ -95,6 +95,10 @@ def _req(method, url, tries=3, timeout=(10, 20), **kw):
 AIRPORTS = [a.strip().upper() for a in
             os.getenv("AIRPORTS", "LMML,GMMX").split(",") if a.strip()]
 AIRPORT_NAMES = {"LMML": "Malta (LMML)", "GMMX": "Marrakech (GMMX)"}
+# Tails to keep an eye on (override with the WATCH env var).
+WATCH = [w.strip().upper() for w in os.getenv("WATCH",
+         "9H-CITY,T7-BSIC,9H-GOAT,9H-EHC,9H-EHB,9H-OTI,9H-EHA"
+         ).split(",") if w.strip()]
 OPENSKY_BASE = "https://opensky-network.org/api"
 TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
              "opensky-network/protocol/openid-connect/token")
@@ -259,6 +263,79 @@ def scheduled_arrivals(airport, hours=48, max_pages=2):
     return out
 
 
+def watch_status(reg):
+    """FlightAware: (location_text, plan_text|None) for one specific tail."""
+    if not AEROAPI_KEY or _time_left() <= 0:
+        return None
+    ident = re.sub(r"[^A-Za-z0-9]", "", reg)
+    try:
+        r = _req("GET", f"{AEROAPI_BASE}/flights/{ident}",
+                 params={"ident_type": "registration", "max_pages": 1},
+                 headers={"x-apikey": AEROAPI_KEY}, tries=1, timeout=(6, 12))
+        if r.status_code != 200:
+            return ("no data", None)
+        flights = r.json().get("flights", [])
+    except Exception:
+        return ("no data", None)
+
+    def code(d):
+        d = d or {}
+        return d.get("code_icao") or d.get("code") or "?"
+
+    now = datetime.now(timezone.utc)
+    airborne = None
+    last_arr = None     # (actual_on_iso, flight)
+    next_plan = None    # (dep_iso, flight)
+    for f in flights:
+        dep = f.get("actual_off") or f.get("actual_out")
+        arr = f.get("actual_on") or f.get("actual_in")
+        if dep and not arr:
+            airborne = f
+        if arr and (last_arr is None or arr > last_arr[0]):
+            last_arr = (arr, f)
+        if not (f.get("actual_out") or f.get("actual_off")):
+            d = f.get("estimated_out") or f.get("scheduled_out")
+            if d:
+                try:
+                    when = datetime.fromisoformat(d.replace("Z", "+00:00"))
+                except Exception:
+                    when = None
+                if when and when >= now - timedelta(hours=1):
+                    if next_plan is None or d < next_plan[0]:
+                        next_plan = (d, f)
+
+    if airborne is not None:
+        eta = (airborne.get("estimated_in") or airborne.get("estimated_on")
+               or airborne.get("scheduled_on"))
+        loc = (f"airborne {code(airborne.get('origin'))}"
+               f"\u2192{code(airborne.get('destination'))}")
+        if eta:
+            loc += f", ETA {fmt_dep(eta)}"
+    elif last_arr is not None:
+        loc = (f"on ground {code(last_arr[1].get('destination'))} "
+               f"since {fmt_dep(last_arr[0])}")
+    else:
+        loc = "no recent activity"
+
+    plan = None
+    if next_plan is not None:
+        plan = f"{code(next_plan[1].get('destination'))} {fmt_dep(next_plan[0])}"
+    return (loc, plan)
+
+
+def render_watch(statuses):
+    lines = ["\U0001F465 <b>Friends fleet</b>"]
+    for reg, st in statuses:
+        if st is None:
+            lines.append(f"\u2022 <b>{reg}</b>  \u2014 lookup unavailable")
+            continue
+        loc, plan = st
+        lines.append(f"\u2022 <b>{reg}</b>  {loc}")
+        lines.append(f"   \u21B3 next: {plan}" if plan
+                     else "   \u21B3 nothing planned")
+    return lines
+
+
 def send_telegram(text):
     _req("POST",
         f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
@@ -364,13 +441,17 @@ def main():
         opensky_ok = False
         print(f"[warn] OpenSky idle scan unavailable: {e}", file=sys.stderr)
 
+    watch = [(reg, watch_status(reg)) for reg in WATCH]
+
     total = sum(len(v) for v in idle.values()) + \
         sum(len(v) for v in inbound.values())
-    if total == 0 and opensky_ok and not SEND_EMPTY:
+    if total == 0 and not WATCH and opensky_ok and not SEND_EMPTY:
         return
 
     blocks = ["\n".join(render_section(ap, idle[ap], inbound[ap], opensky_ok))
               for ap in AIRPORTS]
+    if WATCH:
+        blocks.append("\n".join(render_watch(watch)))
     msg = "\n\n".join(blocks)
     msg += ("\n\nIdle = zero ferry cost. Inbound = about to be on-site. "
             "Check the operator before you call.")
