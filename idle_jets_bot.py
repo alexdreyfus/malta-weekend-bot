@@ -41,7 +41,56 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import socket
+import time as _t
+
 import requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except Exception:  # pragma: no cover
+    Retry = None
+
+# --- Force IPv4 -----------------------------------------------------------
+# GitHub runners intermittently hang on IPv6 connects to some hosts (notably
+# auth.opensky-network.org), surfacing as a connect timeout. Filter DNS to A
+# records so every connection goes over IPv4.
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_only(host, *args, **kwargs):
+    res = _orig_getaddrinfo(host, *args, **kwargs)
+    v4 = [ai for ai in res if ai[0] == socket.AF_INET]
+    return v4 or res  # fall back to original if no A record
+
+
+socket.getaddrinfo = _ipv4_only
+
+# --- Session with connection-level retries --------------------------------
+_SESSION = requests.Session()
+if Retry is not None:
+    _retry = Retry(total=5, connect=5, read=3, backoff_factor=2,
+                   status_forcelist=[429, 500, 502, 503, 504],
+                   allowed_methods=["GET", "POST"])
+    _adapter = HTTPAdapter(max_retries=_retry)
+    _SESSION.mount("https://", _adapter)
+    _SESSION.mount("http://", _adapter)
+
+# (connect timeout, read timeout) -- generous connect for the flaky auth host
+_TIMEOUT = (30, 60)
+
+
+def _req(method, url, **kw):
+    """requests call with retries + backoff on transient network errors."""
+    kw.setdefault("timeout", _TIMEOUT)
+    last = None
+    for attempt in range(5):
+        try:
+            return _SESSION.request(method, url, **kw)
+        except requests.exceptions.RequestException as e:
+            last = e
+            _t.sleep(3 * (attempt + 1))
+    raise last
 
 AIRPORT = "LMML"
 OPENSKY_BASE = "https://opensky-network.org/api"
@@ -73,7 +122,7 @@ AEROAPI_KEY = os.getenv("AEROAPI_KEY", "").strip()
 
 
 def get_token():
-    r = requests.post(TOKEN_URL, timeout=30, data={
+    r = _req("POST", TOKEN_URL, data={
         "grant_type": "client_credentials",
         "client_id": os.environ["OPENSKY_CLIENT_ID"],
         "client_secret": os.environ["OPENSKY_CLIENT_SECRET"]})
@@ -94,10 +143,10 @@ def fetch(endpoint, begin, end, token):
     out = []
     for lo, hi in day_chunks(begin, end):
         try:
-            r = requests.get(
+            r = _req("GET",
                 f"{OPENSKY_BASE}/flights/{endpoint}",
                 params={"airport": AIRPORT, "begin": int(lo), "end": int(hi)},
-                headers=headers, timeout=60)
+                headers=headers)
             if r.status_code == 404:
                 continue
             r.raise_for_status()
@@ -110,7 +159,7 @@ def fetch(endpoint, begin, end, token):
 def enrich(icao24):
     """icao24 -> (registration, typecode). Empty strings if unresolved."""
     try:
-        r = requests.get(ADSBDB + icao24, timeout=15)
+        r = _req("GET", ADSBDB + icao24)
         if r.status_code != 200:
             return "", ""
         ac = r.json().get("response", {}).get("aircraft", {})
@@ -132,10 +181,10 @@ def next_departure(reg):
     Returns (destination_icao, iso_time). Requires AEROAPI_KEY."""
     ident = re.sub(r"[^A-Za-z0-9]", "", reg)  # FlightAware idents drop hyphens
     try:
-        r = requests.get(
+        r = _req("GET",
             f"{AEROAPI_BASE}/flights/{ident}",
             params={"ident_type": "registration", "max_pages": 1},
-            headers={"x-apikey": AEROAPI_KEY}, timeout=20)
+            headers={"x-apikey": AEROAPI_KEY})
         if r.status_code != 200:
             return None
         upcoming = []
@@ -156,9 +205,8 @@ def next_departure(reg):
 
 
 def send_telegram(text):
-    requests.post(
+    _req("POST",
         f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
-        timeout=30,
         data={"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": text,
               "parse_mode": "HTML", "disable_web_page_preview": "true"},
     ).raise_for_status()
