@@ -2,9 +2,9 @@ name: Daily Malta Idle-Jet Radar
 
 on:
   schedule:
-    # 06:00 UTC = 07:00 Malta (winter) / 08:00 (summer). Edit to taste.
-    - cron: "0 6 * * *"
-  workflow_dispatch: {}   # lets you trigger a manual test run from the Actions tab
+    # 4x/day, every 6 hours: 00:00, 06:00, 12:00, 18:00 UTC.
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}   # manual test trigger from the Actions tab
 
 jobs:
   idle-jets:
@@ -25,9 +25,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           OPENSKY_CLIENT_ID: ${{ secrets.OPENSKY_CLIENT_ID }}
           OPENSKY_CLIENT_SECRET: ${{ secrets.OPENSKY_CLIENT_SECRET }}
-          # Optional tuning (uncomment to override defaults):
+          AEROAPI_KEY: ${{ secrets.AEROAPI_KEY }}   # optional; enables flight plans
+          # Optional tuning:
           # LOOKBACK_DAYS: "6"
           # MIN_DWELL_DAYS: "1.0"
           # JETS_ONLY: "1"
+          # REQUIRE_TAIL: "1"
           # SEND_EMPTY: "1"
         run: python idle_jets_bot.py
