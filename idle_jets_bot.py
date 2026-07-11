@@ -66,30 +66,30 @@ def _ipv4_only(host, *args, **kwargs):
 
 socket.getaddrinfo = _ipv4_only
 
-# --- Session with connection-level retries --------------------------------
+# --- Session (no adapter-level retries; we retry explicitly below) ---------
 _SESSION = requests.Session()
-if Retry is not None:
-    _retry = Retry(total=5, connect=5, read=3, backoff_factor=2,
-                   status_forcelist=[429, 500, 502, 503, 504],
-                   allowed_methods=["GET", "POST"])
-    _adapter = HTTPAdapter(max_retries=_retry)
-    _SESSION.mount("https://", _adapter)
-    _SESSION.mount("http://", _adapter)
 
-# (connect timeout, read timeout) -- generous connect for the flaky auth host
-_TIMEOUT = (30, 60)
+_START = _t.time()
+_BUDGET = 150  # seconds: hard ceiling for the whole run's network work
 
 
-def _req(method, url, **kw):
-    """requests call with retries + backoff on transient network errors."""
-    kw.setdefault("timeout", _TIMEOUT)
+def _time_left():
+    return _BUDGET - (_t.time() - _START)
+
+
+def _req(method, url, tries=3, timeout=(10, 20), **kw):
+    """Bounded retry: `tries` attempts, short timeouts, and never retry past
+    the global time budget so one dead host can't hang the run."""
+    kw["timeout"] = timeout
     last = None
-    for attempt in range(5):
+    for attempt in range(tries):
+        if _time_left() <= 0:
+            raise TimeoutError("run time budget exhausted")
         try:
             return _SESSION.request(method, url, **kw)
         except requests.exceptions.RequestException as e:
             last = e
-            _t.sleep(3 * (attempt + 1))
+            _t.sleep(min(2 * (attempt + 1), max(0, _time_left())))
     raise last
 
 AIRPORT = "LMML"
@@ -158,8 +158,10 @@ def fetch(endpoint, begin, end, token):
 
 def enrich(icao24):
     """icao24 -> (registration, typecode). Empty strings if unresolved."""
+    if _time_left() <= 0:
+        return "", ""
     try:
-        r = _req("GET", ADSBDB + icao24)
+        r = _req("GET", ADSBDB + icao24, tries=1, timeout=(5, 8))
         if r.status_code != 200:
             return "", ""
         ac = r.json().get("response", {}).get("aircraft", {})
@@ -179,12 +181,14 @@ def fmt_dep(iso):
 def next_departure(reg):
     """FlightAware: next filed/scheduled departure for a tail, or None.
     Returns (destination_icao, iso_time). Requires AEROAPI_KEY."""
+    if _time_left() <= 0:
+        return None
     ident = re.sub(r"[^A-Za-z0-9]", "", reg)  # FlightAware idents drop hyphens
     try:
         r = _req("GET",
             f"{AEROAPI_BASE}/flights/{ident}",
             params={"ident_type": "registration", "max_pages": 1},
-            headers={"x-apikey": AEROAPI_KEY})
+            headers={"x-apikey": AEROAPI_KEY}, tries=1, timeout=(5, 10))
         if r.status_code != 200:
             return None
         upcoming = []
