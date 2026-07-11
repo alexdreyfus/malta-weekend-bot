@@ -93,9 +93,32 @@ def _req(method, url, tries=3, timeout=(10, 20), **kw):
             _t.sleep(min(2 * (attempt + 1), max(0, _time_left())))
     raise last
 
+# Offline ICAO -> airport name (no API calls). apname keeps the code and
+# appends the name: "LFPB (Paris Le Bourget)".
+try:
+    import airportsdata
+    _AP_DB = airportsdata.load("ICAO")
+except Exception:
+    _AP_DB = {}
+
+
+def apname(code):
+    if not code or code == "?":
+        return code or "?"
+    rec = _AP_DB.get(str(code).upper())
+    if not rec:
+        return code
+    nm = (rec.get("name") or "").replace(" Airport", "").strip()
+    if not nm or len(nm) > 26:
+        nm = rec.get("city") or nm[:26]
+    return f"{code} ({nm})" if nm else code
+
+
 AIRPORTS = [a.strip().upper() for a in
             os.getenv("AIRPORTS", "LMML,GMMX").split(",") if a.strip()]
 AIRPORT_NAMES = {"LMML": "Malta (LMML)", "GMMX": "Marrakech (GMMX)"}
+# FR24 airport filter uses IATA; map our ICAO codes across.
+AIRPORT_IATA = {"LMML": "MLA", "GMMX": "RAK"}
 # Tails to keep an eye on (override with the WATCH env var).
 WATCH = [w.strip().upper() for w in os.getenv("WATCH",
          "9H-CITY,T7-BSIC,9H-GOAT,9H-EHC,9H-EHB,9H-OTI,9H-EHA"
@@ -312,12 +335,12 @@ def _fa_watch(reg):
     if airborne is not None:
         eta = (airborne.get("estimated_in") or airborne.get("estimated_on")
                or airborne.get("scheduled_on"))
-        loc = (f"airborne {code(airborne.get('origin'))}"
-               f"\u2192{code(airborne.get('destination'))}")
+        loc = (f"airborne {apname(code(airborne.get('origin')))}"
+               f"\u2192{apname(code(airborne.get('destination')))}")
         if eta:
             loc += f", ETA {fmt_dep(eta)}"
     elif last_arr is not None:
-        loc = (f"on ground {code(last_arr[1].get('destination'))} "
+        loc = (f"on ground {apname(code(last_arr[1].get('destination')))} "
                f"since {fmt_dep(last_arr[0])}")
 
     plan = None
@@ -348,7 +371,7 @@ def _fr24_location(reg):
                 f = data[0]
                 orig = f.get("orig_icao") or f.get("orig_iata") or "?"
                 dest = f.get("dest_icao") or f.get("dest_iata") or "?"
-                loc = f"airborne {orig}\u2192{dest}"
+                loc = f"airborne {apname(orig)}\u2192{apname(dest)}"
                 if f.get("eta"):
                     loc += f", ETA {fmt_dep(f['eta'])}"
                 return loc
@@ -373,7 +396,7 @@ def _fr24_location(reg):
             if data:
                 f = max(data, key=landed)
                 dest = f.get("dest_icao") or f.get("dest_iata") or "?"
-                return f"on ground {dest} since {fmt_dep(landed(f))}"
+                return f"on ground {apname(dest)} since {fmt_dep(landed(f))}"
     except Exception:
         pass
     return None
@@ -411,8 +434,8 @@ def send_telegram(text):
     ).raise_for_status()
 
 
-def scan_airport(airport, begin, now, token):
-    """Return the sorted list of idle charter aircraft parked at `airport`."""
+def scan_airport_opensky(airport, begin, now, token):
+    """OpenSky fallback: idle charter aircraft parked at `airport`."""
     arrivals = fetch(airport, "arrival", begin, now, token)
     departures = fetch(airport, "departure", begin, now, token)
 
@@ -454,14 +477,91 @@ def scan_airport(airport, begin, now, token):
     return parked
 
 
-def render_section(airport, parked, inbound, opensky_ok):
+def _fr24_summary(airport, direction, frm, to, limit=100):
+    """FR24 flight-summary/light for one direction. Returns list or None."""
+    if _time_left() <= 0:
+        return None
+    code = AIRPORT_IATA.get(airport, airport)
+    try:
+        r = _fr24_get("/flight-summary/light", {
+            "airports": f"{direction}:{code}",
+            "flight_datetime_from": frm,
+            "flight_datetime_to": to,
+            "limit": limit,
+        })
+        if r.status_code != 200:
+            print(f"[warn] FR24 {direction} {airport}: {r.status_code} "
+                  f"{r.text[:180]}", file=sys.stderr)
+            return None
+        return r.json().get("data", []) or []
+    except Exception as e:
+        print(f"[warn] FR24 {direction} {airport}: {e}", file=sys.stderr)
+        return None
+
+
+def fr24_scan_airport(airport, begin_dt, now_dt):
+    """Flightradar24: charter aircraft that arrived at `airport` in the window
+    and have no later departure -> still parked. None if FR24 unavailable."""
+    if not FR24_TOKEN or _time_left() <= 0:
+        return None
+    frm = begin_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    to = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    arrivals = _fr24_summary(airport, "inbound", frm, to)
+    if arrivals is None:
+        return None
+    departures = _fr24_summary(airport, "outbound", frm, to) or []
+
+    last_dep = {}
+    for f in departures:
+        reg = (f.get("reg") or "").upper()
+        t = f.get("datetime_takeoff") or f.get("first_seen")
+        if reg and t and (reg not in last_dep or t > last_dep[reg]):
+            last_dep[reg] = t
+
+    last_arr = {}
+    for f in arrivals:
+        reg = (f.get("reg") or "").upper()
+        t = f.get("datetime_landed") or f.get("last_seen")
+        if not reg or not t:
+            continue
+        if reg not in last_arr or t > last_arr[reg][0]:
+            last_arr[reg] = (t, f)
+
+    parked = []
+    for reg, (arr_t, f) in last_arr.items():
+        if reg in last_dep and last_dep[reg] > arr_t:      # left after arriving
+            continue
+        typ = (f.get("type") or "").upper()
+        if JETS_ONLY and typ and typ not in CHARTER_TYPES:
+            continue
+        try:
+            arr_dt = datetime.fromisoformat(arr_t.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        dwell = (now_dt - arr_dt).total_seconds() / DAY
+        if dwell < MIN_DWELL_DAYS:
+            continue
+        plan = next_departure(reg) if AEROAPI_KEY else None
+        parked.append({
+            "reg": reg,
+            "type": typ or "?",
+            "from": f.get("orig_icao") or f.get("orig_iata") or "?",
+            "dwell": dwell,
+            "arr": arr_dt,
+            "plan": plan,
+        })
+    parked.sort(key=lambda x: x["dwell"], reverse=True)
+    return parked
+
+
+def render_section(airport, parked, inbound):
     name = AIRPORT_NAMES.get(airport, airport)
     lines = [f"\U0001F6E9\uFE0F <b>{name}</b>"]
 
-    # --- Parked / idle now ---
-    if not opensky_ok:
-        lines.append(f"<i>Idle &gt;{MIN_DWELL_DAYS:g}d:</i> scan skipped "
-                     "(OpenSky unreachable this run)")
+    # --- Parked / idle now (parked is None => scan failed this run) ---
+    if parked is None:
+        lines.append(f"<i>Idle &gt;{MIN_DWELL_DAYS:g}d:</i> scan unavailable "
+                     "this run")
     elif not parked:
         lines.append(f"<i>Idle &gt;{MIN_DWELL_DAYS:g}d:</i> none")
     else:
@@ -469,7 +569,7 @@ def render_section(airport, parked, inbound, opensky_ok):
         for p in parked:
             lines.append(
                 f"\u2022 <b>{p['reg']}</b>  {p['type']} \u00B7 {p['dwell']:.1f}d "
-                f"\u00B7 from {p['from']} \u00B7 in {p['arr']:%b %d}")
+                f"\u00B7 from {apname(p['from'])} \u00B7 in {p['arr']:%b %d}")
             if AEROAPI_KEY:
                 if p["plan"]:
                     dest, dep_iso = p["plan"]
@@ -484,7 +584,7 @@ def render_section(airport, parked, inbound, opensky_ok):
             for q in inbound:
                 lines.append(
                     f"\u2b07\uFE0F <b>{q['reg']}</b>  {q['type']} \u00B7 "
-                    f"from {q['from']} \u00B7 ETA {fmt_dep(q['eta'])}")
+                    f"from {apname(q['from'])} \u00B7 ETA {fmt_dep(q['eta'])}")
         else:
             lines.append("<i>Landing &lt;48h:</i> none filed")
     return lines
@@ -493,29 +593,34 @@ def render_section(airport, parked, inbound, opensky_ok):
 def main():
     now = int(time.time())
     begin = now - LOOKBACK_DAYS * DAY
+    now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    begin_dt = datetime.fromtimestamp(begin, tz=timezone.utc)
 
-    # FlightAware arrivals forecast -- independent of OpenSky, so it survives an
-    # OpenSky auth outage.
+    # Forward arrivals forecast (FlightAware).
     inbound = {ap: scheduled_arrivals(ap) for ap in AIRPORTS}
 
-    # OpenSky idle scan -- best effort; a token failure must not kill the run.
-    idle = {ap: [] for ap in AIRPORTS}
-    opensky_ok = True
-    try:
-        token = get_token()
-        idle = {ap: scan_airport(ap, begin, now, token) for ap in AIRPORTS}
-    except Exception as e:
-        opensky_ok = False
-        print(f"[warn] OpenSky idle scan unavailable: {e}", file=sys.stderr)
+    # Idle / presence scan: Flightradar24 primary, OpenSky fallback.
+    # idle[ap] == None -> scan failed for that airport this run.
+    idle = {ap: None for ap in AIRPORTS}
+    if FR24_TOKEN:
+        for ap in AIRPORTS:
+            idle[ap] = fr24_scan_airport(ap, begin_dt, now_dt)
+    else:
+        try:
+            token = get_token()
+            for ap in AIRPORTS:
+                idle[ap] = scan_airport_opensky(ap, begin, now, token)
+        except Exception as e:
+            print(f"[warn] OpenSky idle scan unavailable: {e}", file=sys.stderr)
 
     watch = [(reg, watch_status(reg)) for reg in WATCH]
 
-    total = sum(len(v) for v in idle.values()) + \
-        sum(len(v) for v in inbound.values())
-    if total == 0 and not WATCH and opensky_ok and not SEND_EMPTY:
+    have = (any(idle[ap] for ap in AIRPORTS)
+            or any(inbound.values()) or bool(WATCH))
+    if not have and not SEND_EMPTY:
         return
 
-    blocks = ["\n".join(render_section(ap, idle[ap], inbound[ap], opensky_ok))
+    blocks = ["\n".join(render_section(ap, idle[ap], inbound[ap]))
               for ap in AIRPORTS]
     if WATCH:
         blocks.append("\n".join(render_watch(watch)))
