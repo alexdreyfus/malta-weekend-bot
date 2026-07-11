@@ -25,7 +25,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           OPENSKY_CLIENT_ID: ${{ secrets.OPENSKY_CLIENT_ID }}
           OPENSKY_CLIENT_SECRET: ${{ secrets.OPENSKY_CLIENT_SECRET }}
-          AEROAPI_KEY: ${{ secrets.AEROAPI_KEY }}   # optional; enables flight plans
+          AEROAPI_KEY: ${{ secrets.AEROAPI_KEY }}   # optional; flight plans + inbound
+          FR24_TOKEN: ${{ secrets.FR24_TOKEN }}     # optional; friends-fleet location
           # Optional tuning:
           # LOOKBACK_DAYS: "6"
           # MIN_DWELL_DAYS: "1.0"
