@@ -39,7 +39,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import socket
 import time as _t
@@ -124,7 +124,8 @@ AEROAPI_KEY = os.getenv("AEROAPI_KEY", "").strip()
 
 
 def get_token():
-    r = _req("POST", TOKEN_URL, data={
+    # Auth host is flaky from cloud IPs, so be patient: many tries, long connect.
+    r = _req("POST", TOKEN_URL, tries=6, timeout=(25, 30), data={
         "grant_type": "client_credentials",
         "client_id": os.environ["OPENSKY_CLIENT_ID"],
         "client_secret": os.environ["OPENSKY_CLIENT_SECRET"]})
@@ -211,6 +212,53 @@ def next_departure(reg):
         return None
 
 
+def scheduled_arrivals(airport, hours=48, max_pages=2):
+    """FlightAware: charter aircraft expected to LAND at `airport` within
+    `hours`. Requires AEROAPI_KEY. FlightAware holds filed plans ~2 days out,
+    so this mostly surfaces flights filed within a day or so."""
+    if not AEROAPI_KEY or _time_left() <= 0:
+        return []
+    try:
+        r = _req("GET",
+            f"{AEROAPI_BASE}/airports/{airport}/flights/scheduled_arrivals",
+            params={"max_pages": max_pages},
+            headers={"x-apikey": AEROAPI_KEY}, tries=2, timeout=(10, 20))
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        flights = (data.get("scheduled_arrivals") or data.get("arrivals")
+                   or data.get("flights") or [])
+    except Exception:
+        return []
+    cutoff = datetime.now(timezone.utc) + timedelta(hours=hours)
+    out = []
+    for f in flights:
+        reg = f.get("registration") or ""
+        typ = f.get("aircraft_type") or ""
+        if REQUIRE_TAIL and not reg:
+            continue
+        if JETS_ONLY and typ and typ not in CHARTER_TYPES:
+            continue
+        eta_iso = f.get("estimated_on") or f.get("scheduled_on")
+        if not eta_iso:
+            continue
+        try:
+            eta = datetime.fromisoformat(eta_iso.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if eta > cutoff:
+            continue
+        origin = f.get("origin") or {}
+        out.append({
+            "reg": reg,
+            "type": typ or "?",
+            "from": origin.get("code_icao") or origin.get("code") or "?",
+            "eta": eta_iso,
+        })
+    out.sort(key=lambda x: x["eta"])
+    return out
+
+
 def send_telegram(text):
     _req("POST",
         f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
@@ -262,42 +310,69 @@ def scan_airport(airport, begin, now, token):
     return parked
 
 
-def render_section(airport, parked):
+def render_section(airport, parked, inbound, opensky_ok):
     name = AIRPORT_NAMES.get(airport, airport)
-    lines = [f"\U0001F6E9\uFE0F <b>{name}</b> \u2014 "
-             f"{len(parked)} parked >{MIN_DWELL_DAYS:g}d"]
-    if not parked:
-        lines.append("   nothing idle right now")
-        return lines
-    for p in parked:
-        lines.append(
-            f"\u2022 <b>{p['reg']}</b>  {p['type']} \u00B7 {p['dwell']:.1f}d "
-            f"\u00B7 from {p['from']} \u00B7 in {p['arr']:%b %d}")
-        if AEROAPI_KEY:
-            if p["plan"]:
-                dest, dep_iso = p["plan"]
-                lines.append(f"   \u21B3 next: {dest} \u00B7 {fmt_dep(dep_iso)}")
-            else:
-                lines.append("   \u21B3 no plan filed \u2014 open target")
+    lines = [f"\U0001F6E9\uFE0F <b>{name}</b>"]
+
+    # --- Parked / idle now ---
+    if not opensky_ok:
+        lines.append(f"<i>Idle &gt;{MIN_DWELL_DAYS:g}d:</i> scan skipped "
+                     "(OpenSky unreachable this run)")
+    elif not parked:
+        lines.append(f"<i>Idle &gt;{MIN_DWELL_DAYS:g}d:</i> none")
+    else:
+        lines.append(f"<i>Idle &gt;{MIN_DWELL_DAYS:g}d:</i> {len(parked)}")
+        for p in parked:
+            lines.append(
+                f"\u2022 <b>{p['reg']}</b>  {p['type']} \u00B7 {p['dwell']:.1f}d "
+                f"\u00B7 from {p['from']} \u00B7 in {p['arr']:%b %d}")
+            if AEROAPI_KEY:
+                if p["plan"]:
+                    dest, dep_iso = p["plan"]
+                    lines.append(f"   \u21B3 next: {dest} \u00B7 {fmt_dep(dep_iso)}")
+                else:
+                    lines.append("   \u21B3 no plan filed \u2014 open target")
+
+    # --- Inbound in next 48h (FlightAware) ---
+    if AEROAPI_KEY:
+        if inbound:
+            lines.append(f"<i>Landing &lt;48h:</i> {len(inbound)}")
+            for q in inbound:
+                lines.append(
+                    f"\u2b07\uFE0F <b>{q['reg']}</b>  {q['type']} \u00B7 "
+                    f"from {q['from']} \u00B7 ETA {fmt_dep(q['eta'])}")
+        else:
+            lines.append("<i>Landing &lt;48h:</i> none filed")
     return lines
 
 
 def main():
     now = int(time.time())
     begin = now - LOOKBACK_DAYS * DAY
-    token = get_token()
 
-    results = {ap: scan_airport(ap, begin, now, token) for ap in AIRPORTS}
-    total = sum(len(v) for v in results.values())
+    # FlightAware arrivals forecast -- independent of OpenSky, so it survives an
+    # OpenSky auth outage.
+    inbound = {ap: scheduled_arrivals(ap) for ap in AIRPORTS}
 
-    if total == 0 and not SEND_EMPTY:
+    # OpenSky idle scan -- best effort; a token failure must not kill the run.
+    idle = {ap: [] for ap in AIRPORTS}
+    opensky_ok = True
+    try:
+        token = get_token()
+        idle = {ap: scan_airport(ap, begin, now, token) for ap in AIRPORTS}
+    except Exception as e:
+        opensky_ok = False
+        print(f"[warn] OpenSky idle scan unavailable: {e}", file=sys.stderr)
+
+    total = sum(len(v) for v in idle.values()) + \
+        sum(len(v) for v in inbound.values())
+    if total == 0 and opensky_ok and not SEND_EMPTY:
         return
 
-    blocks = []
-    for ap in AIRPORTS:
-        blocks.append("\n".join(render_section(ap, results[ap])))
+    blocks = ["\n".join(render_section(ap, idle[ap], inbound[ap], opensky_ok))
+              for ap in AIRPORTS]
     msg = "\n\n".join(blocks)
-    msg += ("\n\nAlready on-site = zero ferry cost. "
+    msg += ("\n\nIdle = zero ferry cost. Inbound = about to be on-site. "
             "Check the operator before you call.")
     send_telegram(msg)
 
