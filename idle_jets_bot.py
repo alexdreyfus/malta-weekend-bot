@@ -2,35 +2,41 @@
 """
 idle_jets_bot.py
 ----------------
-Daily Telegram alert of private/business jets sitting IDLE at Malta
-International (LMML). A jet that arrived N days ago and hasn't departed is a
-charter candidate with no positioning (ferry) cost -- the metal is already here.
+Telegram alert of private/business jets sitting IDLE at Malta International
+(LMML) -- arrived N days ago, not departed since. Charter candidates with no
+positioning (ferry) cost because the metal is already on-island.
 
-Reuses the malta-weekend-bot's existing Telegram secrets. Only new secrets:
-OpenSky OAuth credentials.
+Runs 4x/day. Reuses the malta-weekend-bot Telegram secrets.
 
-NOTE ON DATA FRESHNESS
-======================
-OpenSky's arrival/departure tables are built by a nightly batch, so they run
-roughly a day behind and each query is capped at a ~2-day window (we slice the
-lookback into daily chunks below to respect that). For spotting jets parked
-more than a day this lag is fine; the one edge effect is that a jet which left
-*this morning* may still show as parked until the batch catches up.
+WHAT EACH RUN DOES
+==================
+1. OpenSky (free): arrivals minus departures over the lookback -> still parked,
+   with dwell time. OpenSky's flight tables are batched nightly, so this list
+   only really changes once a day -- that's a data limit, not a bug.
+2. adsbdb (free): icao24 -> registration + type. Rows with no resolvable tail
+   number are dropped (REQUIRE_TAIL), since there's nothing actionable there.
+3. FlightAware AeroAPI (paid, OPTIONAL): if AEROAPI_KEY is set, each parked
+   tail is checked for an upcoming filed departure (destination + time). This
+   is the layer that updates through the day, which is why we run 4x. With no
+   key set, this step is skipped entirely and costs nothing.
 
 ENV / SECRETS
 =============
   TELEGRAM_BOT_TOKEN    (already in the repo)
   TELEGRAM_CHAT_ID      (already in the repo)
-  OPENSKY_CLIENT_ID     (new -- opensky-network.org Account page)
-  OPENSKY_CLIENT_SECRET (new)
+  OPENSKY_CLIENT_ID     (opensky-network.org Account page)
+  OPENSKY_CLIENT_SECRET
+  AEROAPI_KEY           (OPTIONAL -- flightaware.com/aeroapi; enables flight plans)
 Optional tuning:
   LOOKBACK_DAYS   default 6
   MIN_DWELL_DAYS  default 1.0
-  JETS_ONLY       default "1"    (set "0" to include everything parked)
-  SEND_EMPTY      default "1"    (set "0" to stay silent when nothing found)
+  JETS_ONLY       default "1"   (set "0" to include non-jets)
+  REQUIRE_TAIL    default "1"   (set "0" to keep tail-less rows)
+  SEND_EMPTY      default "1"   (set "0" to stay silent when nothing found)
 """
 
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -41,22 +47,29 @@ AIRPORT = "LMML"
 OPENSKY_BASE = "https://opensky-network.org/api"
 TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
              "opensky-network/protocol/openid-connect/token")
-ADSBDB = "https://api.adsbdb.com/v0/aircraft/"  # free icao24 -> reg/type lookup
+ADSBDB = "https://api.adsbdb.com/v0/aircraft/"
+AEROAPI_BASE = "https://aeroapi.flightaware.com/aeroapi"
 DAY = 86400
 
-BIZJET_TYPES = {
+CHARTER_TYPES = {
     "C25A","C25B","C25C","C25M","C500","C501","C510","C525","C550","C560",
     "C56X","C650","C680","C68A","C700","C750","CL30","CL35","CL60","GL5T",
     "GL7T","GLEX","GLF4","GLF5","GLF6","GA5C","GA6C","GA7C","G150","G280",
     "LJ35","LJ45","LJ60","LJ70","LJ75","FA10","FA20","FA50","FA7X","FA8X",
     "F900","F2TH","FA5X","E50P","E55P","E545","E550","E135","E35L","H25B",
     "HA4T","HDJT","PC24","PRM1","BE40","CL600","CL604",
+    # Turboprops commonly chartered:
+    "PC12","TBM7","TBM8","TBM9","TBM10","PC6T","P180","B350","BE20",
+    "BE9L","BE9T","C208","C208B","C425","C441","DHC6","AC90","AC95",
+    "SW4","E110","PAY1","PAY2","PAY3","PAY4","MU2",
 }
 
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "6"))
 MIN_DWELL_DAYS = float(os.getenv("MIN_DWELL_DAYS", "1.0"))
 JETS_ONLY = os.getenv("JETS_ONLY", "1") == "1"
+REQUIRE_TAIL = os.getenv("REQUIRE_TAIL", "1") == "1"
 SEND_EMPTY = os.getenv("SEND_EMPTY", "1") == "1"
+AEROAPI_KEY = os.getenv("AEROAPI_KEY", "").strip()
 
 
 def get_token():
@@ -69,16 +82,14 @@ def get_token():
 
 
 def day_chunks(begin, end):
-    """Yield [lo, hi] slices <= 1 day, aligned to UTC midnight, so each call
-    stays within OpenSky's 2-day / single-day-boundary interval limit."""
-    t = begin - (begin % DAY)  # floor to UTC midnight
+    """<=1-day UTC-midnight-aligned slices (OpenSky flight interval cap)."""
+    t = begin - (begin % DAY)
     while t < end:
         yield max(t, begin), min(t + DAY, end)
         t += DAY
 
 
 def fetch(endpoint, begin, end, token):
-    """endpoint in {'arrival','departure'}; queries in daily slices."""
     headers = {"Authorization": f"Bearer {token}"}
     out = []
     for lo, hi in day_chunks(begin, end):
@@ -87,17 +98,17 @@ def fetch(endpoint, begin, end, token):
                 f"{OPENSKY_BASE}/flights/{endpoint}",
                 params={"airport": AIRPORT, "begin": int(lo), "end": int(hi)},
                 headers=headers, timeout=60)
-            if r.status_code == 404:      # no flights in this slice
+            if r.status_code == 404:
                 continue
             r.raise_for_status()
             out.extend(r.json())
-        except Exception as e:            # one bad slice shouldn't kill the run
+        except Exception as e:
             print(f"[warn] {endpoint} {int(lo)}-{int(hi)}: {e}", file=sys.stderr)
     return out
 
 
 def enrich(icao24):
-    """Best-effort icao24 -> (registration, typecode). Degrades gracefully."""
+    """icao24 -> (registration, typecode). Empty strings if unresolved."""
     try:
         r = requests.get(ADSBDB + icao24, timeout=15)
         if r.status_code != 200:
@@ -108,13 +119,47 @@ def enrich(icao24):
         return "", ""
 
 
+def fmt_dep(iso):
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).strftime(
+            "%b %d %H:%MZ")
+    except Exception:
+        return iso
+
+
+def next_departure(reg):
+    """FlightAware: next filed/scheduled departure for a tail, or None.
+    Returns (destination_icao, iso_time). Requires AEROAPI_KEY."""
+    ident = re.sub(r"[^A-Za-z0-9]", "", reg)  # FlightAware idents drop hyphens
+    try:
+        r = requests.get(
+            f"{AEROAPI_BASE}/flights/{ident}",
+            params={"ident_type": "registration", "max_pages": 1},
+            headers={"x-apikey": AEROAPI_KEY}, timeout=20)
+        if r.status_code != 200:
+            return None
+        upcoming = []
+        for f in r.json().get("flights", []):
+            if f.get("actual_out"):                    # already left the gate
+                continue
+            dep = f.get("estimated_out") or f.get("scheduled_out")
+            if dep:
+                upcoming.append((dep, f))
+        if not upcoming:
+            return None
+        upcoming.sort(key=lambda x: x[0])
+        dep_iso, f = upcoming[0]
+        dest = (f.get("destination") or {})
+        return (dest.get("code_icao") or dest.get("code") or "?", dep_iso)
+    except Exception:
+        return None
+
+
 def send_telegram(text):
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
     requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
+        f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
         timeout=30,
-        data={"chat_id": chat_id, "text": text,
+        data={"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": text,
               "parse_mode": "HTML", "disable_web_page_preview": "true"},
     ).raise_for_status()
 
@@ -141,38 +186,48 @@ def main():
     parked = []
     for icao24, a in last_arr.items():
         arr_t = a.get("lastSeen") or 0
-        if last_dep.get(icao24, 0) > arr_t:          # departed after arriving
+        if last_dep.get(icao24, 0) > arr_t:
             continue
         dwell = (now - arr_t) / DAY
         if dwell < MIN_DWELL_DAYS:
             continue
         reg, typ = enrich(icao24)
-        if JETS_ONLY and typ and typ not in BIZJET_TYPES:
+        if REQUIRE_TAIL and not reg:                  # no tail -> not actionable
             continue
+        if JETS_ONLY and typ and typ not in CHARTER_TYPES:
+            continue
+        plan = next_departure(reg) if (AEROAPI_KEY and reg) else None
         parked.append({
             "reg": reg or icao24.upper(),
             "type": typ or "?",
             "from": a.get("estDepartureAirport") or "?",
             "dwell": dwell,
             "arr": datetime.fromtimestamp(arr_t, tz=timezone.utc),
+            "plan": plan,
         })
 
     parked.sort(key=lambda x: x["dwell"], reverse=True)
 
     if not parked:
         if SEND_EMPTY:
-            send_telegram("\U0001F6E9\uFE0F <b>Malta idle-jet radar</b>\nNothing parked "
-                          f"over {MIN_DWELL_DAYS:g}d right now.")
+            send_telegram("\U0001F6E9\uFE0F <b>Malta idle-jet radar</b>\nNo "
+                          f"actionable tails parked over {MIN_DWELL_DAYS:g}d.")
         return
 
-    lines = [f"\U0001F6E9\uFE0F <b>Idle jets at Malta (LMML)</b> \u2014 {len(parked)} parked "
-             f">{MIN_DWELL_DAYS:g}d\n"]
+    lines = [f"\U0001F6E9\uFE0F <b>Idle jets at Malta (LMML)</b> \u2014 "
+             f"{len(parked)} parked >{MIN_DWELL_DAYS:g}d\n"]
     for p in parked:
         lines.append(
-            f"\u2022 <b>{p['reg']}</b>  {p['type']} \u00B7 {p['dwell']:.1f}d \u00B7 "
-            f"from {p['from']} \u00B7 in {p['arr']:%b %d}")
+            f"\u2022 <b>{p['reg']}</b>  {p['type']} \u00B7 {p['dwell']:.1f}d "
+            f"\u00B7 from {p['from']} \u00B7 in {p['arr']:%b %d}")
+        if AEROAPI_KEY:
+            if p["plan"]:
+                dest, dep_iso = p["plan"]
+                lines.append(f"   \u21B3 next: {dest} \u00B7 {fmt_dep(dep_iso)}")
+            else:
+                lines.append("   \u21B3 no plan filed \u2014 open target")
     lines.append("\nAlready on-island = zero ferry cost. "
-                 "Cross-check the tail's operator before you call.")
+                 "Check the operator before you call.")
     send_telegram("\n".join(lines))
 
 
