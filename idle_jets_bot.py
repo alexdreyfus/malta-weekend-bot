@@ -149,6 +149,7 @@ MIN_DWELL_DAYS = float(os.getenv("MIN_DWELL_DAYS", "1.0"))
 JETS_ONLY = os.getenv("JETS_ONLY", "1") == "1"
 REQUIRE_TAIL = os.getenv("REQUIRE_TAIL", "1") == "1"
 SEND_EMPTY = os.getenv("SEND_EMPTY", "1") == "1"
+USE_OPENSKY = os.getenv("USE_OPENSKY", "1") == "1"  # free secondary source
 AEROAPI_KEY = os.getenv("AEROAPI_KEY", "").strip()
 FR24_TOKEN = os.getenv("FR24_TOKEN", "").strip()
 
@@ -499,9 +500,9 @@ def _fr24_summary(airport, direction, frm, to, limit=100):
         return None
 
 
-def fr24_scan_airport(airport, begin_dt, now_dt):
-    """Flightradar24: charter aircraft that arrived at `airport` in the window
-    and have no later departure -> still parked. None if FR24 unavailable."""
+def _fr24_candidates(airport, begin_dt, now_dt):
+    """FR24 arrivals-minus-departures -> dict reg -> {type, from, arr_dt}.
+    Cheap first pass; None if FR24 is unavailable this run."""
     if not FR24_TOKEN or _time_left() <= 0:
         return None
     frm = begin_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -510,48 +511,151 @@ def fr24_scan_airport(airport, begin_dt, now_dt):
     if arrivals is None:
         return None
     departures = _fr24_summary(airport, "outbound", frm, to) or []
-
     last_dep = {}
     for f in departures:
         reg = (f.get("reg") or "").upper()
         t = f.get("datetime_takeoff") or f.get("first_seen")
         if reg and t and (reg not in last_dep or t > last_dep[reg]):
             last_dep[reg] = t
-
-    last_arr = {}
+    cand = {}
     for f in arrivals:
         reg = (f.get("reg") or "").upper()
         t = f.get("datetime_landed") or f.get("last_seen")
         if not reg or not t:
             continue
-        if reg not in last_arr or t > last_arr[reg][0]:
-            last_arr[reg] = (t, f)
-
-    parked = []
-    for reg, (arr_t, f) in last_arr.items():
-        if reg in last_dep and last_dep[reg] > arr_t:      # left after arriving
+        if reg in cand and t <= cand[reg]["_t"]:
             continue
-        typ = (f.get("type") or "").upper()
-        if JETS_ONLY and typ and typ not in CHARTER_TYPES:
+        if reg in last_dep and last_dep[reg] > t:      # departed after arriving
+            cand.pop(reg, None)
             continue
         try:
-            arr_dt = datetime.fromisoformat(arr_t.replace("Z", "+00:00"))
+            arr_dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
         except Exception:
+            continue
+        cand[reg] = {"type": (f.get("type") or "").upper(),
+                     "from": f.get("orig_icao") or f.get("orig_iata") or "?",
+                     "arr_dt": arr_dt, "_t": t}
+    return cand
+
+
+def _opensky_candidates(airport, begin, now):
+    """Free secondary source -> dict reg -> {...}. None on failure (fast-fail
+    token so a flaky OpenSky never stalls the run)."""
+    try:
+        r = _req("POST", TOKEN_URL, tries=1, timeout=(8, 12), data={
+            "grant_type": "client_credentials",
+            "client_id": os.environ["OPENSKY_CLIENT_ID"],
+            "client_secret": os.environ["OPENSKY_CLIENT_SECRET"]})
+        r.raise_for_status()
+        token = r.json()["access_token"]
+    except Exception:
+        return None
+    try:
+        parked = scan_airport_opensky(airport, begin, now, token)
+    except Exception:
+        return None
+    out = {}
+    for p in parked:
+        out[p["reg"].upper()] = {"type": p["type"], "from": p["from"],
+                                 "arr_dt": p["arr"]}
+    return out
+
+
+def _fr24_airborne(regs):
+    """Subset of regs currently airborne (FR24 live feed). Bulk, chunked."""
+    regs = [r for r in regs if r]
+    if not regs or not FR24_TOKEN or _time_left() <= 0:
+        return set()
+    out = set()
+    for i in range(0, len(regs), 15):
+        try:
+            r = _fr24_get("/live/flight-positions/light",
+                          {"registrations": ",".join(regs[i:i + 15])})
+            if r.status_code == 200:
+                for f in (r.json().get("data", []) or []):
+                    if f.get("reg"):
+                        out.add(f["reg"].upper())
+        except Exception:
+            pass
+    return out
+
+
+def _fr24_last_landing(reg):
+    """Most recent completed flight -> (dest_icao, landed_iso) or None."""
+    if not FR24_TOKEN or _time_left() <= 0:
+        return None
+    now = datetime.now(timezone.utc)
+    frm = (now - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    to = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        r = _fr24_get("/flight-summary/light",
+                      {"registrations": reg,
+                       "flight_datetime_from": frm, "flight_datetime_to": to})
+        if r.status_code != 200:
+            return None
+        data = r.json().get("data", []) or []
+    except Exception:
+        return None
+    best = None
+    for f in data:
+        t = f.get("datetime_landed") or f.get("last_seen")
+        if not t:
+            continue
+        if best is None or t > best[1]:
+            best = (f.get("dest_icao") or f.get("dest_iata") or "?", t)
+    return best
+
+
+def scan_parked(airport, begin, now, begin_dt, now_dt):
+    """Merged, accuracy-verified parked list for `airport`. FR24 primary +
+    OpenSky secondary for discovery; live + last-landing checks for truth.
+    Returns list, or None if every source was unavailable this run."""
+    fr = _fr24_candidates(airport, begin_dt, now_dt)
+    osc = _opensky_candidates(airport, begin, now) if USE_OPENSKY else {}
+    fr_ok, os_ok = fr is not None, osc is not None
+    fr, osc = fr or {}, osc or {}
+    if not fr_ok and not os_ok:
+        return None
+
+    cand = {}
+    for reg in set(fr) | set(osc):
+        base = dict(fr.get(reg) or osc.get(reg) or {})
+        srcs = ([s for s, d in (("FR24", fr), ("OS", osc)) if reg in d])
+        base["src"] = "+".join(srcs)
+        cand[reg] = base
+
+    airborne = _fr24_airborne(list(cand)) if FR24_TOKEN else set()
+    icao, iata = airport, AIRPORT_IATA.get(airport, "")
+    result = []
+    for reg, m in cand.items():
+        if reg in airborne:                       # flying now -> it left
+            continue
+        arr_dt = m.get("arr_dt")
+        if FR24_TOKEN:                            # confirm it is still here
+            last = _fr24_last_landing(reg)
+            if last is not None:
+                dest, landed_iso = last
+                if dest not in (icao, iata):     # last landed elsewhere -> left
+                    continue
+                try:
+                    arr_dt = datetime.fromisoformat(
+                        landed_iso.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+        if arr_dt is None:
             continue
         dwell = (now_dt - arr_dt).total_seconds() / DAY
         if dwell < MIN_DWELL_DAYS:
             continue
+        typ = m.get("type") or "?"
+        if JETS_ONLY and typ != "?" and typ not in CHARTER_TYPES:
+            continue
         plan = next_departure(reg) if AEROAPI_KEY else None
-        parked.append({
-            "reg": reg,
-            "type": typ or "?",
-            "from": f.get("orig_icao") or f.get("orig_iata") or "?",
-            "dwell": dwell,
-            "arr": arr_dt,
-            "plan": plan,
-        })
-    parked.sort(key=lambda x: x["dwell"], reverse=True)
-    return parked
+        result.append({"reg": reg, "type": typ, "from": m.get("from", "?"),
+                       "dwell": dwell, "arr": arr_dt, "plan": plan,
+                       "src": m.get("src", "")})
+    result.sort(key=lambda x: x["dwell"], reverse=True)
+    return result
 
 
 def render_section(airport, parked, inbound):
@@ -567,9 +671,12 @@ def render_section(airport, parked, inbound):
     else:
         lines.append(f"<i>Idle &gt;{MIN_DWELL_DAYS:g}d:</i> {len(parked)}")
         for p in parked:
-            lines.append(
-                f"\u2022 <b>{p['reg']}</b>  {p['type']} \u00B7 {p['dwell']:.1f}d "
-                f"\u00B7 from {apname(p['from'])} \u00B7 in {p['arr']:%b %d}")
+            base = (f"\u2022 <b>{p['reg']}</b>  {p['type']} \u00B7 "
+                    f"{p['dwell']:.1f}d \u00B7 from {apname(p['from'])} \u00B7 "
+                    f"in {p['arr']:%b %d}")
+            if p.get("src"):
+                base += f" \u00B7 <i>{p['src']}</i>"
+            lines.append(base)
             if AEROAPI_KEY:
                 if p["plan"]:
                     dest, dep_iso = p["plan"]
@@ -599,19 +706,10 @@ def main():
     # Forward arrivals forecast (FlightAware).
     inbound = {ap: scheduled_arrivals(ap) for ap in AIRPORTS}
 
-    # Idle / presence scan: Flightradar24 primary, OpenSky fallback.
-    # idle[ap] == None -> scan failed for that airport this run.
-    idle = {ap: None for ap in AIRPORTS}
-    if FR24_TOKEN:
-        for ap in AIRPORTS:
-            idle[ap] = fr24_scan_airport(ap, begin_dt, now_dt)
-    else:
-        try:
-            token = get_token()
-            for ap in AIRPORTS:
-                idle[ap] = scan_airport_opensky(ap, begin, now, token)
-        except Exception as e:
-            print(f"[warn] OpenSky idle scan unavailable: {e}", file=sys.stderr)
+    # Idle / presence scan: FR24 primary + OpenSky secondary, each candidate
+    # verified on the ground here now. idle[ap] == None -> scan unavailable.
+    idle = {ap: scan_parked(ap, begin, now, begin_dt, now_dt)
+            for ap in AIRPORTS}
 
     watch = [(reg, watch_status(reg)) for reg in WATCH]
 
