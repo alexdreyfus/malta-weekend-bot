@@ -26,7 +26,8 @@ ENV / SECRETS
   TELEGRAM_CHAT_ID      (already in the repo)
   OPENSKY_CLIENT_ID     (opensky-network.org Account page)
   OPENSKY_CLIENT_SECRET
-  AEROAPI_KEY           (OPTIONAL -- flightaware.com/aeroapi; enables flight plans)
+  AEROAPI_KEY           (OPTIONAL -- flightaware.com/aeroapi; plans + inbound)
+  FR24_TOKEN            (OPTIONAL -- fr24api.flightradar24.com; watchlist location)
 Optional tuning:
   LOOKBACK_DAYS   default 6
   MIN_DWELL_DAYS  default 1.0
@@ -104,6 +105,7 @@ TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
              "opensky-network/protocol/openid-connect/token")
 ADSBDB = "https://api.adsbdb.com/v0/aircraft/"
 AEROAPI_BASE = "https://aeroapi.flightaware.com/aeroapi"
+FR24_BASE = "https://fr24api.flightradar24.com/api"
 DAY = 86400
 
 CHARTER_TYPES = {
@@ -125,6 +127,7 @@ JETS_ONLY = os.getenv("JETS_ONLY", "1") == "1"
 REQUIRE_TAIL = os.getenv("REQUIRE_TAIL", "1") == "1"
 SEND_EMPTY = os.getenv("SEND_EMPTY", "1") == "1"
 AEROAPI_KEY = os.getenv("AEROAPI_KEY", "").strip()
+FR24_TOKEN = os.getenv("FR24_TOKEN", "").strip()
 
 
 def get_token():
@@ -263,29 +266,30 @@ def scheduled_arrivals(airport, hours=48, max_pages=2):
     return out
 
 
-def watch_status(reg):
-    """FlightAware: (location_text, plan_text|None) for one specific tail."""
+def _fa_watch(reg):
+    """FlightAware -> (location|None, plan|None). location None if FA has no data
+    (common for blocked 9H tails); plan is the next filed leg if any."""
     if not AEROAPI_KEY or _time_left() <= 0:
-        return None
+        return (None, None)
     ident = re.sub(r"[^A-Za-z0-9]", "", reg)
     try:
         r = _req("GET", f"{AEROAPI_BASE}/flights/{ident}",
                  params={"ident_type": "registration", "max_pages": 1},
                  headers={"x-apikey": AEROAPI_KEY}, tries=1, timeout=(6, 12))
         if r.status_code != 200:
-            return ("no data", None)
+            return (None, None)
         flights = r.json().get("flights", [])
     except Exception:
-        return ("no data", None)
+        return (None, None)
+    if not flights:
+        return (None, None)
 
     def code(d):
         d = d or {}
         return d.get("code_icao") or d.get("code") or "?"
 
     now = datetime.now(timezone.utc)
-    airborne = None
-    last_arr = None     # (actual_on_iso, flight)
-    next_plan = None    # (dep_iso, flight)
+    airborne = last_arr = next_plan = None
     for f in flights:
         dep = f.get("actual_off") or f.get("actual_out")
         arr = f.get("actual_on") or f.get("actual_in")
@@ -304,6 +308,7 @@ def watch_status(reg):
                     if next_plan is None or d < next_plan[0]:
                         next_plan = (d, f)
 
+    loc = None
     if airborne is not None:
         eta = (airborne.get("estimated_in") or airborne.get("estimated_on")
                or airborne.get("scheduled_on"))
@@ -314,13 +319,75 @@ def watch_status(reg):
     elif last_arr is not None:
         loc = (f"on ground {code(last_arr[1].get('destination'))} "
                f"since {fmt_dep(last_arr[0])}")
-    else:
-        loc = "no recent activity"
 
     plan = None
     if next_plan is not None:
         plan = f"{code(next_plan[1].get('destination'))} {fmt_dep(next_plan[0])}"
     return (loc, plan)
+
+
+def _fr24_get(path, params):
+    return _req("GET", FR24_BASE + path, params=params,
+                headers={"Accept": "application/json",
+                         "Authorization": f"Bearer {FR24_TOKEN}",
+                         "Accept-Version": "v1"},
+                tries=2, timeout=(8, 15))
+
+
+def _fr24_location(reg):
+    """Flightradar24 -> location string or None. Live feed for airborne tails,
+    else most recent completed flight for parked ones."""
+    if not FR24_TOKEN or _time_left() <= 0:
+        return None
+    # 1) Airborne right now?
+    try:
+        r = _fr24_get("/live/flight-positions/full", {"registrations": reg})
+        if r.status_code == 200:
+            data = r.json().get("data", []) or []
+            if data:
+                f = data[0]
+                orig = f.get("orig_icao") or f.get("orig_iata") or "?"
+                dest = f.get("dest_icao") or f.get("dest_iata") or "?"
+                loc = f"airborne {orig}\u2192{dest}"
+                if f.get("eta"):
+                    loc += f", ETA {fmt_dep(f['eta'])}"
+                return loc
+    except Exception:
+        pass
+    # 2) Parked -> most recent completed flight -> on ground at its destination.
+    try:
+        now = datetime.now(timezone.utc)
+        frm = (now - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        to = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = _fr24_get("/flight-summary/light",
+                      {"registrations": reg,
+                       "flight_datetime_from": frm,
+                       "flight_datetime_to": to})
+        if r.status_code == 200:
+            data = r.json().get("data", []) or []
+
+            def landed(f):
+                return f.get("datetime_landed") or f.get("last_seen") or ""
+
+            data = [f for f in data if landed(f)]
+            if data:
+                f = max(data, key=landed)
+                dest = f.get("dest_icao") or f.get("dest_iata") or "?"
+                return f"on ground {dest} since {fmt_dep(landed(f))}"
+    except Exception:
+        pass
+    return None
+
+
+def watch_status(reg):
+    """Combine sources: FR24 for location (better coverage of blocked 9H
+    tails), FlightAware for the next filed plan. Returns (loc, plan)."""
+    if not (FR24_TOKEN or AEROAPI_KEY):
+        return None
+    fr_loc = _fr24_location(reg) if FR24_TOKEN else None
+    fa_loc, fa_plan = _fa_watch(reg)
+    loc = fr_loc or fa_loc or "no recent activity"
+    return (loc, fa_plan)
 
 
 def render_watch(statuses):
